@@ -1,3 +1,5 @@
+#:indentSize=2:noTabs=true:
+
 """Copyright 2008 Orbitz WorldWide
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +21,7 @@ from django.conf import settings
 from graphite.logger import log
 from graphite.storage import STORE, LOCAL_STORE
 from graphite.render.hashing import ConsistentHashRing
+from graphite.render.relayrules import loadRelayRules
 
 try:
   import cPickle as pickle
@@ -133,8 +136,11 @@ class CarbonLinkPool:
   def query(self, metric):
     request = dict(type='cache-query', metric=metric)
     results = self.send_request(request)
-    log.cache("CarbonLink cache-query request for %s returned %d datapoints" % (metric, len(results)))
-    return results['datapoints']
+    if results:
+      log.cache("CarbonLink cache-query request for %s returned %d datapoints" % (metric, len(results)))
+      return results['datapoints']
+    else:
+      return None
 
   def get_metadata(self, metric, key):
     request = dict(type='get-metadata', metric=metric, key=key)
@@ -155,25 +161,60 @@ class CarbonLinkPool:
     request_packet = len_prefix + serialized_request
 
     host = self.select_host(metric)
-    conn = self.get_connection(host)
-    try:
-      conn.sendall(request_packet)
-      result = self.recv_response(conn)
-    except:
-      self.last_failure[host] = time.time()
-      raise
-    else:
-      self.connections[host].add(conn)
-      if 'error' in result:
-        raise CarbonLinkRequestError(result['error'])
+    if host:
+      conn = self.get_connection(host)
+      try:
+        conn.sendall(request_packet)
+        result = self.recv_response(conn)
+      except:
+        self.last_failure[host] = time.time()
+        raise
       else:
-        return result
+        self.connections[host].add(conn)
+        if 'error' in result:
+          raise CarbonLinkRequestError(result['error'])
+        else:
+          return result
+    else:
+      return None
 
   def recv_response(self, conn):
     len_prefix = recv_exactly(conn, 4)
     body_size = struct.unpack("!L", len_prefix)[0]
     body = recv_exactly(conn, body_size)
     return pickle.loads(body)
+
+class RulesBasedCarbonLinkPool(CarbonLinkPool):
+  def __init__(self, hosts, timeout, relay_rules_path):
+    CarbonLinkPool.__init__(self, hosts, timeout)
+    self.host_dict = {}
+    for host in self.hosts:
+      self.host_dict[host[1]] = host
+    try:
+      self.rules = loadRelayRules(relay_rules_path)
+    except Exception as ex:
+      log.exception(ex)
+      raise
+
+  def select_host(self, metric):
+    "Returns the carbon host that has data for the given metric"
+    node = None
+    try:
+      node = self.getDestinations(metric)
+    except Exception as ex:
+      log.exception(ex)
+    return node
+
+  def getDestinations(self, key):
+    #Hosts is a list of tuples [('ip', 'instnace'), ('ip', 'instnace')]
+    #Destinations is a list if tuples [('ip',port,'instance'),('ip',port,'instance')]
+    for rule in self.rules:
+      if rule.matches(key):
+        for destination in rule.destinations:
+          if destination[2] in self.host_dict:
+            return self.host_dict[destination[2]]
+        if not rule.continue_matching:
+          return None
 
 
 # Utilities
@@ -205,8 +246,12 @@ for host in settings.CARBONLINK_HOSTS:
 
 
 #A shared importable singleton
-CarbonLink = CarbonLinkPool(hosts, settings.CARBONLINK_TIMEOUT)
+CarbonLink = None
 
+if settings.CARBONLINK_RELAY_TYPE == "rules":
+  CarbonLink = RulesBasedCarbonLinkPool(hosts, settings.CARBONLINK_TIMEOUT, settings.CARBONLINK_RULE_PATH) 
+else:
+  CarbonLink = CarbonLinkPool(hosts, settings.CARBONLINK_TIMEOUT)
 
 # Data retrieval API
 def fetchData(requestContext, pathExpr):
@@ -224,7 +269,10 @@ def fetchData(requestContext, pathExpr):
     dbResults = dbFile.fetch( timestamp(startTime), timestamp(endTime) )
     try:
       cachedResults = CarbonLink.query(dbFile.real_metric)
-      results = mergeResults(dbResults, cachedResults)
+      if cachedResults:
+        results = mergeResults(dbResults, cachedResults)
+      else:
+        results = dbResults
     except:
       log.exception()
       results = dbResults

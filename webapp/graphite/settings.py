@@ -73,6 +73,8 @@ LOG_RENDERING_PERFORMANCE = False
 #Miscellaneous settings
 CARBONLINK_HOSTS = ["127.0.0.1:7002"]
 CARBONLINK_TIMEOUT = 1.0
+CARBONLINK_RELAY_TYPE = "rules"
+CARBONLINK_RULE_PATH = "/opt/graphite/conf/relay-rules.conf"
 SMTP_SERVER = "localhost"
 DOCUMENTATION_URL = "http://graphite.readthedocs.org/"
 ALLOW_ANONYMOUS_CLI = True
